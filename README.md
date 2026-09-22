@@ -47,14 +47,16 @@ differs from older Climate TRACE material:
 │   ├── logging_config.py    loguru bootstrap and stdlib interception
 │   ├── client.py            resilient Climate TRACE API v7 client
 │   ├── transformer.py       payload schemas + normalisation into pandas DataFrames
-│   └── loader.py            DuckDB / MotherDuck loading and data marts
+│   ├── loader.py            DuckDB / MotherDuck loading and data marts
+│   └── main.py              CLI entrypoint (run-etl)
 ├── tests/
 │   ├── conftest.py          environment isolation and loguru reset fixtures
 │   ├── test_config.py
 │   ├── test_logging.py
 │   ├── test_client.py
 │   ├── test_transformer.py
-│   └── test_loader.py
+│   ├── test_loader.py
+│   └── test_main.py
 ├── .env.example             documented environment template
 ├── pyproject.toml           Poetry, ruff and pytest configuration
 └── README.md
@@ -201,6 +203,35 @@ summary.as_dict()  # {'staging_rows': 13, 'corporate_rows': 10, 'detail_rows': 1
 every log line, and otherwise warns while falling back to a throw-away in-memory DuckDB. That
 keeps the same code path usable locally, in CI and in tests (`duckdb.connect(":memory:")`).
 
+### Running the pipeline
+
+```bash
+poetry run run-etl --dry-run --max-records 5      # extract + transform, no writes
+poetry run run-etl --max-records 500 --workers 8  # full run into MotherDuck
+poetry run run-etl --help
+```
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--max-records N` | unlimited | Facilities extracted from `GET /sources`. |
+| `--max-enrich-records N` | `MAX_ENRICH_RECORDS` | Facilities enriched with owners through `GET /sources/:id`. |
+| `--workers N` | `ENRICH_WORKERS` | Enrichment threads (`1` = sequential). |
+| `--schema NAME` | `MOTHERDUCK_SCHEMA` | Target schema for the staging table and the marts. |
+| `--dry-run` | off | Extract and transform only, skipping every write. |
+| `--log-level LEVEL` | `LOG_LEVEL` | `TRACE` … `CRITICAL`. |
+
+`run-etl` exits with `0` on success and `1` for any failure (API, configuration, DuckDB), and
+finishes with a single summary line:
+
+```
+extracted_facilities=4 | enriched_facilities=4 | owner_rows=5 | requests=5 | retries=0 |
+duration_seconds=1.77 | dry_run=False | staging_rows=5 | corporate_rows=4 | detail_rows=5
+```
+
+An enrichment failure never sinks a run: affected facilities keep their listing document and are
+attributed to `State / Unmapped Owner`. `--dry-run` logs the top rows by attributed emissions
+instead of writing them.
+
 ## Configuration reference
 
 Every setting lives in `src/climate_trace_etl/config.py` and is read from environment variables
@@ -230,8 +261,9 @@ or `.env`. Values are validated at startup (fail fast), empty variables are igno
 ```bash
 poetry run pytest                # unit tests
 poetry run pytest tests/test_client.py -q
-poetry run ruff check .          # lint rules: E, W, F, I, B, C4, UP, SIM, RET, PTH, RUF
+poetry run ruff check .          # lint rules: E, W, F, I, B, BLE, C4, UP, SIM, RET, PTH, RUF
 poetry run ruff format .         # auto-format (line length 100, Markdown code blocks included)
+poetry run run-etl --dry-run --max-records 5   # end-to-end smoke test without writes
 ```
 
 ## MotherDuck data marts

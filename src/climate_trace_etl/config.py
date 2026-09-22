@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +27,9 @@ ENV_FILE: Path = PROJECT_ROOT / ".env"
 
 #: Log levels understood by loguru.
 LogLevel = Literal["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"]
+
+#: Every supported log level, handy for CLI ``choices``.
+LOG_LEVELS: tuple[str, ...] = get_args(LogLevel)
 
 #: Deployment targets used to switch environment-specific behaviour.
 Environment = Literal["local", "ci", "prod"]
