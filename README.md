@@ -14,6 +14,9 @@ Climate TRACE API v7  ──httpx + tenacity──▶  client  ──▶  transf
                                                                                                      mart_company_assets_detail
 ```
 
+The published marts also back `streamlit_app.py`, a Streamlit dashboard that runs on Streamlit
+Community Cloud — see [Dashboard](#dashboard-streamlit-community-cloud).
+
 ## Data source notes
 
 The v7 API documentation (<https://api.climatetrace.org/v7/docs>) is the source of truth and
@@ -42,6 +45,11 @@ differs from older Climate TRACE material:
 ```
 .
 ├── .github/workflows/emissions_etl.yml   # manual CI run: lint, tests, ETL, mart verification
+├── streamlit_app.py         Streamlit dashboard (entrypoint on Streamlit Community Cloud)
+├── requirements.txt         dashboard dependencies installed by Community Cloud
+├── .streamlit/
+│   ├── config.toml          dashboard theme and browser configuration
+│   └── secrets.toml.example documented secrets template (secrets.toml itself is gitignored)
 ├── src/climate_trace_etl/
 │   ├── __init__.py          package metadata and version
 │   ├── config.py            pydantic-settings configuration + get_settings()
@@ -59,7 +67,8 @@ differs from older Climate TRACE material:
 │   ├── test_transformer.py
 │   ├── test_loader.py
 │   ├── test_diagnostics.py
-│   └── test_main.py
+│   ├── test_main.py
+│   └── test_dashboard.py
 ├── .env.example             documented environment template
 ├── pyproject.toml           Poetry, ruff and pytest configuration
 └── README.md
@@ -263,6 +272,58 @@ An enrichment failure never sinks a run: affected facilities keep their listing 
 attributed to `State / Unmapped Owner`. `--dry-run` logs the top rows by attributed emissions
 instead of writing them.
 
+## Dashboard (Streamlit Community Cloud)
+
+`streamlit_app.py` presents the marts as an interactive dashboard: KPI cards (companies, Mt CO2e,
+countries, facilities), a top-N ranking coloured by country, a sector treemap, a yearly trend
+and a facility drill-down table. The sidebar filters by country, sector and year, controls the
+top-N size and toggles whether state / unmapped owners (`is_state_or_unmapped_owner`) are
+included; the *Обновить данные* button drops the cached dropdowns after a fresh `run-etl`.
+
+### Running locally
+
+The dashboard dependencies ship with the default Poetry install (the `dashboard` group in
+`pyproject.toml`), so `poetry install` is enough:
+
+```bash
+poetry install                                  # includes the dashboard group
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+$EDITOR .streamlit/secrets.toml                 # fill in MOTHERDUCK_TOKEN
+poetry run streamlit run streamlit_app.py
+```
+
+`DASHBOARD_DUCKDB_PATH` renders a local DuckDB file that already contains the marts instead of
+MotherDuck, which is how the unit tests and offline demos run the page:
+
+```bash
+DASHBOARD_DUCKDB_PATH=/tmp/emissions.duckdb poetry run streamlit run streamlit_app.py
+```
+
+### Deploying to Streamlit Community Cloud
+
+1. Push the repository to GitHub.
+2. Open <https://share.streamlit.io> → **Create app** → select the repository, the `main` branch
+   and `streamlit_app.py` as the main file path.
+3. Open **Advanced settings → Secrets** and paste the same keys as in `.env.example`.
+4. **Deploy** — the app rebuilds automatically on every push to the tracked branch.
+
+| Secret | Default | Purpose |
+| --- | --- | --- |
+| `MOTHERDUCK_TOKEN` | *(required)* | Token with read access to the marts; a read-scaling token is enough. |
+| `MOTHERDUCK_DATABASE` | `emissions_db` | Database that hosts the marts. |
+| `MOTHERDUCK_SCHEMA` | `main` | Schema that hosts the marts. |
+| `MOTHERDUCK_ATTACH_MODE` | `single` | `single` keeps the dashboard out of the saved MotherDuck workspace, `workspace` reuses it, `default` omits the parameter. |
+| `DASHBOARD_DUCKDB_PATH` | *(unset)* | Render a local DuckDB snapshot instead of MotherDuck. |
+
+Community Cloud installs `requirements.txt` from the repository root, because that file takes
+precedence over `pyproject.toml` in its dependency resolution; the dashboard pins its four
+dependencies there. The page is read-only (it never writes to the marts) and every filter is
+bound as a query parameter, so a country or sector name can never end up interpolated into SQL.
+
+```bash
+poetry run pytest tests/test_dashboard.py -q   # AppTest renders the page against a snapshot
+```
+
 ## Configuration reference
 
 Every setting lives in `src/climate_trace_etl/config.py` and is read from environment variables
@@ -293,6 +354,7 @@ or `.env`. Values are validated at startup (fail fast), empty variables are igno
 ```bash
 poetry run pytest                # unit tests
 poetry run pytest tests/test_client.py -q
+poetry run pytest tests/test_dashboard.py -q   # dashboard page (AppTest)
 poetry run ruff check .          # lint rules: E, W, F, I, B, BLE, C4, UP, SIM, RET, PTH, RUF
 poetry run ruff format .         # auto-format (line length 100, Markdown code blocks included)
 poetry run run-etl --dry-run --max-records 5   # end-to-end smoke test without writes
@@ -307,7 +369,9 @@ starts exactly when you ask for one.
 2. Optionally override the inputs: facilities to extract, facilities to enrich, worker threads,
    target schema, and a dry-run toggle that skips every write to MotherDuck.
 3. The `quality` job lints, checks formatting and runs the unit tests; the `etl` job then
-   extracts, transforms, loads, and finally verifies that both marts contain rows.
+   extracts, transforms, loads, and finally verifies that both marts contain rows. The default
+   `poetry install` also pulls the `dashboard` group, so `tests/test_dashboard.py` runs in CI
+   next to the pipeline tests.
 
 Setup:
 

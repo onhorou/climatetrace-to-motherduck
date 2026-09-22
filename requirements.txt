@@ -1,0 +1,11 @@
+# Dependencies of the Streamlit dashboard (streamlit_app.py), installed by Streamlit Community
+# Cloud:
+# https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/app-dependencies
+#
+# The pipeline itself is managed by Poetry (`poetry install`); this file exists because
+# Community Cloud prefers requirements.txt over pyproject.toml. For local dashboard work use
+# `poetry install --with dashboard` instead of duplicating the environment here.
+duckdb>=1.1
+pandas>=2.2
+plotly>=5.24
+streamlit>=1.49

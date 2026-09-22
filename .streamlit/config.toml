@@ -1,0 +1,9 @@
+# Streamlit configuration for the Climate TRACE dashboard (streamlit_app.py).
+# No secrets belong here: they live in .streamlit/secrets.toml locally and in the
+# Streamlit Community Cloud app settings when deployed (see secrets.toml.example).
+[theme]
+base = "light"
+primaryColor = "#1B7F5A"
+
+[browser]
+gatherUsageStats = false

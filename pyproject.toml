@@ -40,6 +40,13 @@ dev = [
   "pytest>=8.3",
   "ruff>=0.8",
 ]
+# Runtime extras of the Streamlit dashboard (streamlit_app.py). PEP 735 groups are installed by
+# default, so `poetry install` already provides them; Streamlit Community Cloud instead installs
+# the same set from requirements.txt, which it prefers over pyproject.toml.
+dashboard = [
+  "plotly>=5.24",
+  "streamlit>=1.49",
+]
 
 [tool.poetry]
 packages = [{ include = "climate_trace_etl", from = "src" }]
@@ -64,6 +71,10 @@ select = ["E", "W", "F", "I", "B", "BLE", "C4", "UP", "SIM", "RET", "PTH", "RUF"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E501"]
+# The dashboard renders a Russian UI on purpose; Cyrillic strings, docstrings and comments are
+# flagged as "ambiguous unicode" otherwise.
+"streamlit_app.py" = ["RUF001", "RUF002", "RUF003"]
+"tests/test_dashboard.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.format]
 docstring-code-format = true
