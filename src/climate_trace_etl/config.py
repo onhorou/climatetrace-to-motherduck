@@ -59,6 +59,23 @@ class Settings(BaseSettings):
         le=10_000,
         description="Amount of records requested per paginated Climate TRACE API call.",
     )
+    max_enrich_records: int = Field(
+        default=500,
+        ge=1,
+        le=100_000,
+        description=(
+            "Maximum number of facilities enriched with ownership details through "
+            "'GET /sources/:id'. Each enriched facility costs one extra API request."
+        ),
+    )
+    enrich_workers: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description=(
+            "Worker threads used to enrich facilities concurrently. Set to 1 to run sequentially."
+        ),
+    )
     emissions_gas: str = Field(
         default="co2e_100yr",
         min_length=1,

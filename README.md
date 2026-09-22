@@ -28,10 +28,14 @@ differs from older Climate TRACE material:
 * There is **no nested `emissionsSummary`** in the payload; the latest reporting year and
   `co2e_100yr` emissions come from `year` + `emissionsQuantity` / `totals`.
 * `GET /v7/owners?name=…` returns owner `id`/`name` pairs only, and `owners` can be `null`.
-  The API publishes **no ownership percentage**, so `ownership_share` is treated as a
-  configurable/enrichable input that defaults to `1.0` (100 % attribution) while the
-  `emissions × ownership_share` formula stays intact; facilities without owners are labelled
-  `State / Unmapped Owner`.
+  The API publishes **no ownership percentage**, so the transformer derives `ownership_share`
+  as `1.0` for a sole owner and `1 / n` for `n` owners (equal-split estimate); every row is
+  flagged through `ownership_share_is_estimated`. The
+  `attributed_emissions = total_emissions × ownership_share` formula stays intact, and
+  facilities without published owners are attributed to `State / Unmapped Owner`.
+* The `/sources` list payload contains **no owners at all**, so facilities are enriched
+  individually through `GET /sources/:id`, capped by `MAX_ENRICH_RECORDS` (one request per
+  facility).
 
 ## Repository layout
 
@@ -41,12 +45,16 @@ differs from older Climate TRACE material:
 │   ├── __init__.py          package metadata and version
 │   ├── config.py            pydantic-settings configuration + get_settings()
 │   ├── logging_config.py    loguru bootstrap and stdlib interception
-│   └── client.py            resilient Climate TRACE API v7 client
+│   ├── client.py            resilient Climate TRACE API v7 client
+│   ├── transformer.py       payload schemas + normalisation into pandas DataFrames
+│   └── loader.py            DuckDB / MotherDuck loading and data marts
 ├── tests/
 │   ├── conftest.py          environment isolation and loguru reset fixtures
 │   ├── test_config.py
 │   ├── test_logging.py
-│   └── test_client.py
+│   ├── test_client.py
+│   ├── test_transformer.py
+│   └── test_loader.py
 ├── .env.example             documented environment template
 ├── pyproject.toml           Poetry, ruff and pytest configuration
 └── README.md
@@ -120,7 +128,9 @@ from climate_trace_etl.client import ClimateTraceClient
 with ClimateTraceClient() as client:
     # paginated asset list; offset/limit handled for you, bounded by max_records
     sources = client.fetch_sources(max_records=500, sectors="power")
-    # one facility, including owners[] and the yearly emission time series
+    # concurrent ownership enrichment (ENRICH_WORKERS threads, 1 request per facility)
+    details = list(client.iter_source_details([s["id"] for s in sources], max_records=500))
+    # or, one facility at a time, including owners[] and the yearly emission time series
     detail = client.fetch_source(sources[0]["id"])
     # owner (company) lookup by name
     owners = client.search_owners("Petro", limit=20)
@@ -143,9 +153,53 @@ Client behaviour:
 | Pagination | `limit`/`offset` paging until a short or empty page; a page-count limit and a repeated-page guard stop a misbehaving API. |
 | Retries | `429`, `500`, `502`, `503`, `504` and `httpx.TransportError` (DNS, resets, timeouts), up to `MAX_RETRIES` additional attempts. |
 | Backoff | Exponential with jitter, bounded by `8 × RETRY_BACKOFF_SECONDS`, overridden by a numeric `Retry-After` header (HTTP-date values are ignored). |
+| Concurrency | Facility enrichment runs on `ENRICH_WORKERS` threads, keeps the input order and is capped by `MAX_ENRICH_RECORDS` (`1` thread = sequential). |
 | Errors | `ClimateTraceHTTPError` (fails fast, e.g. `400`/`404`), `RetryableHTTPError` (carries `retry_after`), `ClimateTraceResponseError` (HTTP 200 with an unexpected body). All inherit `ClimateTraceAPIError` and expose `url`, `status_code` and `detail`. |
 | Counters | `client.request_count` / `client.retry_count` feed the run summary. |
 | Payloads | Raw JSON documents exactly as returned by the API; schema validation belongs to the transformer. |
+
+### Normalising the extraction
+
+```python
+from climate_trace_etl.transformer import transform_assets
+
+frame = transform_assets(detail_documents)  # one row per (facility, owner)
+frame[["facility_name", "company_name", "country", "reporting_year", "attributed_emissions_tco2e"]]
+```
+
+The frame carries the columns of `ASSET_OWNER_COLUMNS` with pinned dtypes
+(`Int64` / `float64` / `bool` / `string`), so it can be registered in DuckDB as-is:
+
+| Column group | Columns |
+| --- | --- |
+| Identity | `source_id`, `facility_name`, `sector`, `subsector`, `country`, `asset_type`, `source_type` |
+| Geography | `latitude`, `longitude` (NA when the API publishes no coordinates) |
+| Emissions | `gas`, `reporting_year`, `total_emissions_tco2e`, `emissions_reported` |
+| Ownership | `company_id`, `company_name`, `owner_index`, `owner_count`, `ownership_share`, `ownership_share_is_estimated` |
+| Attribution | `attributed_emissions_tco2e` |
+
+`emissions_reported` separates a reported `0` from a facility whose emissions are not published
+yet, and malformed documents are logged and skipped instead of aborting the run.
+
+### Loading into MotherDuck
+
+```python
+from climate_trace_etl.config import get_settings
+from climate_trace_etl.loader import connect, publish_frame
+from climate_trace_etl.transformer import transform_assets
+
+settings = get_settings()
+frame = transform_assets(detail_documents, gas=settings.emissions_gas)
+
+with connect(settings) as connection:  # md:<database>?motherduck_token=…
+    summary = publish_frame(connection, frame, schema=settings.motherduck_schema)
+
+summary.as_dict()  # {'staging_rows': 13, 'corporate_rows': 10, 'detail_rows': 13}
+```
+
+`connect()` targets MotherDuck as soon as `MOTHERDUCK_TOKEN` is configured, masks the token in
+every log line, and otherwise warns while falling back to a throw-away in-memory DuckDB. That
+keeps the same code path usable locally, in CI and in tests (`duckdb.connect(":memory:")`).
 
 ## Configuration reference
 
@@ -160,6 +214,8 @@ or `.env`. Values are validated at startup (fail fast), empty variables are igno
 | `MOTHERDUCK_SCHEMA` | `main` | Target schema for the data marts. |
 | `CLIMATE_TRACE_API_URL` | `https://api.climatetrace.org/v7` | API base URL (trailing slash normalised). |
 | `FETCH_LIMIT` | `500` | Records per paginated API request (`1`–`10000`). |
+| `MAX_ENRICH_RECORDS` | `500` | Facilities enriched with ownership details via `GET /sources/:id` (one request each). |
+| `ENRICH_WORKERS` | `8` | Worker threads for concurrent enrichment (`1`–`32`; `1` = sequential). |
 | `EMISSIONS_GAS` | `co2e_100yr` | Gas queried from the API (`co2e_100yr`, `co2`, `ch4`, `n2o`, …). |
 | `EMISSIONS_YEAR` | *(unset → latest)* | Restrict the extraction to one year (`2021`–`2100`). |
 | `REQUEST_TIMEOUT_SECONDS` | `30` | Timeout of a single HTTP request. |
@@ -180,12 +236,15 @@ poetry run ruff format .         # auto-format (line length 100, Markdown code b
 
 ## MotherDuck data marts
 
-The loader publishes two presentation marts inside `MOTHERDUCK_DATABASE` / `MOTHERDUCK_SCHEMA`:
+Every run replaces `stg_asset_owners` (one row per facility × owner) together with both
+presentation marts inside `MOTHERDUCK_DATABASE` / `MOTHERDUCK_SCHEMA`, which makes re-runs
+idempotent and keeps the marts from blending two extraction windows.
 
-| Mart | Grain | Contents |
+| Object | Grain | Contents |
 | --- | --- | --- |
-| `mart_corporate_emissions` | company × country × sector × year | attributed emissions totals and facility counts per company. |
-| `mart_company_assets_detail` | facility × owner | facility metadata, coordinates, ownership share and attributed emissions. |
+| `stg_asset_owners` | facility × owner | staging copy of the transformed frame. |
+| `mart_corporate_emissions` | company × country × sector × year | `facility_count`, `sum(attributed_emissions_tco2e)`, `avg_ownership_share`, `ownership_share_is_estimated`, `is_state_or_unmapped_owner`. |
+| `mart_company_assets_detail` | facility × owner | facility metadata, coordinates, `year`, `ownership_share`, `total_emissions_tco2e` and `attributed_emissions_tco2e`, plus the same ownership flags. |
 
 Dashboard queries:
 

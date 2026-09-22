@@ -403,3 +403,53 @@ def test_non_numeric_retry_after_headers_are_ignored() -> None:
     assert _parse_retry_after(httpx.Response(503)) is None
     http_date = {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"}
     assert _parse_retry_after(httpx.Response(503, headers=http_date)) is None
+
+
+# ----------------------------------------------------------------- enrichment ---
+def test_iter_source_details_preserves_order_with_concurrent_workers() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        source_id = int(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(200, json={**source(1), "id": source_id})
+
+    with make_client(handler, enrich_workers=4) as client:
+        details = list(client.iter_source_details([1, 2, 3, 4, 5], workers=4))
+        assert client.request_count == 5
+
+    assert [detail["id"] for detail in details] == [1, 2, 3, 4, 5]
+
+
+def test_iter_source_details_caps_the_number_of_requests() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=source(1))
+
+    with make_client(handler, enrich_workers=3) as client:
+        details = list(client.iter_source_details(range(10), max_records=3))
+        assert client.request_count == 3
+
+    assert len(details) == 3
+
+
+def test_iter_source_details_can_run_sequentially() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=source(1))
+
+    with make_client(handler) as client:
+        details = list(client.iter_source_details([1, 2], workers=1))
+
+    assert len(details) == 2
+    assert len(requests) == 2
+
+
+def test_concurrent_requests_are_counted_thread_safely() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=source(1))
+
+    with make_client(handler, enrich_workers=8) as client:
+        details = list(client.iter_source_details(range(50)))
+
+    assert len(details) == 50
+    assert client.request_count == 50
+    assert client.retry_count == 0

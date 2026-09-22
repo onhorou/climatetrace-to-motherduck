@@ -17,7 +17,10 @@ The client returns raw JSON documents; schema validation belongs to
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+import threading
+from collections.abc import Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from typing import Any
 
 import httpx
@@ -149,6 +152,7 @@ class ClimateTraceClient:
         self.settings = settings or get_settings()
         self.request_count = 0
         self.retry_count = 0
+        self._lock = threading.Lock()
         self._http = http_client or httpx.Client(
             timeout=httpx.Timeout(self.settings.request_timeout_seconds),
             follow_redirects=True,
@@ -264,6 +268,42 @@ class ClimateTraceClient:
         payload = self._get_json(f"sources/{source_id}", {})
         return self._expect_mapping(payload, endpoint=f"sources/{source_id}")
 
+    def iter_source_details(
+        self,
+        source_ids: Iterable[int | str],
+        *,
+        max_records: int | None = None,
+        workers: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield ``GET /sources/:id`` documents for ``source_ids``.
+
+        The ``/sources`` list payload carries no ownership information, so facilities have to be
+        enriched individually — one request each. Requests run concurrently on ``ENRICH_WORKERS``
+        threads (``1`` disables concurrency) while the results keep the order of ``source_ids``,
+        and ``max_records`` bounds how many facilities are enriched.
+
+        Args:
+            source_ids: Identifier of the facilities to enrich.
+            max_records: Maximum number of documents to fetch; ``None`` means no limit.
+            workers: Overrides ``ENRICH_WORKERS`` for this call.
+
+        Yields:
+            Raw detail documents, in the order of ``source_ids``.
+        """
+        selected = source_ids if max_records is None else islice(source_ids, max_records)
+        if max_records is not None:
+            logger.debug("enriching at most {} facility detail(s)", max_records)
+
+        worker_count = self.settings.enrich_workers if workers is None else workers
+        if worker_count <= 1:
+            for source_id in selected:
+                yield self.fetch_source(source_id)
+            return
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="enrich") as pool:
+            # ``map`` streams results as requests complete but yields them in input order.
+            yield from pool.map(self.fetch_source, selected)
+
     def search_owners(
         self,
         name: str | None = None,
@@ -296,7 +336,8 @@ class ClimateTraceClient:
         """Single GET attempt; raises exactly the exception that the retry policy inspects."""
         url = self._url(path)
         clean_params = {key: value for key, value in params.items() if value is not None}
-        self.request_count += 1
+        with self._lock:
+            self.request_count += 1
         logger.debug("GET {} params={}", url, clean_params)
 
         response = self._http.get(url, params=clean_params, headers=self.headers)
@@ -331,7 +372,8 @@ class ClimateTraceClient:
 
     def _log_retry(self, retry_state: RetryCallState) -> None:
         """Log a pending retry (wired into tenacity as its ``before_sleep`` hook)."""
-        self.retry_count += 1
+        with self._lock:
+            self.retry_count += 1
         action = retry_state.next_action
         delay = 0.0 if action is None else action.sleep
         logger.warning(
