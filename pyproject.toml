@@ -28,6 +28,7 @@ dependencies = [
 
 [project.scripts]
 run-etl = "climate_trace_etl.main:main"
+check-motherduck = "climate_trace_etl.diagnostics:main"
 
 [project.urls]
 Homepage = "https://github.com/onhorou/climatetrace-to-motherduck"

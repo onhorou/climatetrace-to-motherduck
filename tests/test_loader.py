@@ -14,14 +14,16 @@ import pandas as pd
 import pytest
 from loguru import logger
 
-from climate_trace_etl.config import Settings
+from climate_trace_etl.config import ConfigurationError, Settings
 from climate_trace_etl.loader import (
     ASSET_OWNER_TABLE,
     MART_COMPANY_ASSETS_DETAIL,
     MART_CORPORATE_EMISSIONS,
     connect,
     count_rows,
+    create_database_sql,
     create_marts,
+    ensure_motherduck_database,
     load_asset_owners,
     mask_dsn,
     publish_frame,
@@ -91,6 +93,63 @@ def capture_connect_target(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
     return captured
 
 
+class MissingDatabaseError(duckdb.Error):
+    """Stands in for the ``InvalidInputException`` MotherDuck raises for unknown databases."""
+
+
+class BootstrapRecorder:
+    """Stand-in for the short-lived ``md:`` connection that creates a missing database."""
+
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+        self.closed = False
+
+    def execute(self, sql: str) -> BootstrapRecorder:
+        self.statements.append(sql)
+        return self
+
+    def __enter__(self) -> BootstrapRecorder:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.closed = True
+
+
+def missing_database_error(database: str = "emissions_db") -> MissingDatabaseError:
+    """Reproduce the MotherDuck message for a database the token cannot see."""
+    return MissingDatabaseError(
+        f"Failed to attach '{database}': no database/share named '{database}' found"
+    )
+
+
+def install_bootstrap_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fail_after_create: bool = False,
+) -> tuple[list[str], BootstrapRecorder]:
+    """Patch ``duckdb.connect``: the attach fails once, the ``md:`` connection creates the database.
+
+    Returns the connection targets in call order and the recorder used for the bootstrap
+    connection.
+    """
+    real_connect = duckdb.connect
+    targets: list[str] = []
+    admin = BootstrapRecorder()
+    state = {"created": False}
+
+    def fake_connect(target: str, **kwargs: Any) -> Any:
+        targets.append(target)
+        if target.startswith("md:?"):
+            state["created"] = not fail_after_create
+            return admin
+        if target.startswith("md:") and not state["created"]:
+            raise missing_database_error()
+        return real_connect(":memory:")
+
+    monkeypatch.setattr("climate_trace_etl.loader.duckdb.connect", fake_connect)
+    return targets, admin
+
+
 # ------------------------------------------------------------------ connection ---
 def test_quote_identifier_escapes_embedded_quotes() -> None:
     assert quote_identifier("plain") == '"plain"'
@@ -100,6 +159,13 @@ def test_quote_identifier_escapes_embedded_quotes() -> None:
 def test_mask_dsn_hides_the_token() -> None:
     assert mask_dsn("md:db?motherduck_token=secret") == "md:db?motherduck_token=***"
     assert mask_dsn(":memory:") == ":memory:"
+
+
+def test_mask_dsn_keeps_the_non_secret_parameters() -> None:
+    masked = mask_dsn("md:db?motherduck_token=secret&attach_mode=single")
+
+    assert masked == "md:db?motherduck_token=***&attach_mode=single"
+    assert "secret" not in masked
 
 
 def test_connect_falls_back_to_memory_without_a_token() -> None:
@@ -134,7 +200,7 @@ def test_connect_uses_the_motherduck_dsn_when_configured(
     finally:
         logger.remove(sink_id)
 
-    assert captured["target"] == "md:emissions_db?motherduck_token=secret-token"
+    assert captured["target"] == "md:emissions_db?motherduck_token=secret-token&attach_mode=single"
     assert all("secret-token" not in message for message in messages)
 
 
@@ -146,6 +212,88 @@ def test_connect_prefers_an_explicit_database(monkeypatch: pytest.MonkeyPatch) -
     handle.close()
 
     assert captured["target"] == ":memory:"
+
+
+def test_connect_creates_a_missing_motherduck_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first attach fails with 'no database/share named', so the loader bootstraps it."""
+    targets, admin = install_bootstrap_connect(monkeypatch)
+    settings = Settings(_env_file=None, motherduck_token="secret-token")
+    expected_dsn = "md:emissions_db?motherduck_token=secret-token&attach_mode=single"
+    messages: list[str] = []
+    sink_id = logger.add(messages.append, level="DEBUG", format="{message}")
+    try:
+        handle = connect(settings)
+        handle.close()
+    finally:
+        logger.remove(sink_id)
+
+    assert targets == [expected_dsn, "md:?motherduck_token=secret-token", expected_dsn]
+    assert admin.statements == ['create database if not exists "emissions_db"']
+    assert admin.closed is True
+    assert any("creating it" in message for message in messages)
+    assert any("MotherDuck database emissions_db is ready" in message for message in messages)
+    assert all("secret-token" not in message for message in messages)
+
+
+def test_connect_read_only_never_creates_the_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    targets, admin = install_bootstrap_connect(monkeypatch)
+    settings = Settings(_env_file=None, motherduck_token="secret-token")
+
+    with pytest.raises(ConfigurationError, match="check-motherduck"):
+        connect(settings, read_only=True)
+
+    assert targets == ["md:emissions_db?motherduck_token=secret-token&attach_mode=single"]
+    assert admin.statements == []
+
+
+def test_connect_reports_a_failed_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A token that cannot create the database produces an actionable ConfigurationError."""
+    targets, admin = install_bootstrap_connect(monkeypatch, fail_after_create=True)
+    settings = Settings(_env_file=None, motherduck_token="secret-token")
+
+    with pytest.raises(ConfigurationError, match="MOTHERDUCK_DATABASE"):
+        connect(settings)
+
+    assert len(targets) == 3
+    assert admin.statements == ['create database if not exists "emissions_db"']
+
+
+def test_connect_propagates_unrelated_motherduck_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_connect(target: str, **kwargs: Any) -> Any:
+        raise duckdb.Error("Authentication failed: invalid token")
+
+    monkeypatch.setattr("climate_trace_etl.loader.duckdb.connect", fake_connect)
+    settings = Settings(_env_file=None, motherduck_token="secret-token")
+
+    with pytest.raises(duckdb.Error, match="Authentication failed"):
+        connect(settings)
+
+
+def test_ensure_motherduck_database_uses_the_workspace_dsn(monkeypatch: pytest.MonkeyPatch) -> None:
+    targets: list[str] = []
+    admin = BootstrapRecorder()
+
+    def fake_connect(target: str, **kwargs: Any) -> Any:
+        targets.append(target)
+        return admin
+
+    monkeypatch.setattr("climate_trace_etl.loader.duckdb.connect", fake_connect)
+    settings = Settings(
+        _env_file=None,
+        motherduck_token="secret-token",
+        motherduck_database="analytics",
+    )
+
+    assert ensure_motherduck_database(settings) == "analytics"
+    assert targets == ["md:?motherduck_token=secret-token"]
+    assert admin.statements == ['create database if not exists "analytics"']
+
+
+def test_create_database_sql_quotes_the_identifier() -> None:
+    assert create_database_sql("emissions_db") == 'create database if not exists "emissions_db"'
+    assert create_database_sql('we"ird') == 'create database if not exists "we""ird"'
 
 
 # --------------------------------------------------------------------- staging ---

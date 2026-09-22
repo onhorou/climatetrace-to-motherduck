@@ -34,6 +34,12 @@ LOG_LEVELS: tuple[str, ...] = get_args(LogLevel)
 #: Deployment targets used to switch environment-specific behaviour.
 Environment = Literal["local", "ci", "prod"]
 
+#: MotherDuck attach modes; ``single`` keeps automated runs out of the saved workspace, while
+#: ``default`` omits the parameter and leaves the choice to the MotherDuck extension (workspace
+#: mode). See
+#: https://motherduck.com/docs/key-tasks/authenticating-and-connecting-to-motherduck/attach-modes/
+MotherDuckAttachMode = Literal["workspace", "single", "default"]
+
 
 class ConfigurationError(RuntimeError):
     """Raised when the configuration is valid on its own but incomplete for the task at hand.
@@ -116,6 +122,14 @@ class Settings(BaseSettings):
     )
     motherduck_database: str = Field(default="emissions_db", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     motherduck_schema: str = Field(default="main", pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    motherduck_attach_mode: MotherDuckAttachMode = Field(
+        default="single",
+        description=(
+            "MotherDuck attach mode: 'single' keeps automated runs in a one-off session that "
+            "neither reads nor pollutes the saved workspace, 'workspace' reuses the attachments "
+            "of the MotherDuck UI. The pipeline only ever needs a single database."
+        ),
+    )
 
     # --------------------------------------------------------------- Runtime ---
     environment: Environment = "local"
@@ -147,9 +161,8 @@ class Settings(BaseSettings):
         """``True`` when a non-empty MotherDuck token is available."""
         return self.motherduck_token is not None and bool(self.motherduck_token.get_secret_value())
 
-    @property
-    def motherduck_dsn(self) -> str:
-        """MotherDuck connection string, e.g. ``md:emissions_db?motherduck_token=***``.
+    def require_motherduck_token(self) -> str:
+        """Return the plaintext MotherDuck token.
 
         Raises:
             ConfigurationError: if ``MOTHERDUCK_TOKEN`` is not configured.
@@ -159,12 +172,55 @@ class Settings(BaseSettings):
             raise ConfigurationError(
                 "MOTHERDUCK_TOKEN is not set: export it or add it to .env before loading data."
             )
-        return f"md:{self.motherduck_database}?motherduck_token={token.get_secret_value()}"
+        return token.get_secret_value()
+
+    @property
+    def motherduck_attach_mode_parameter(self) -> str:
+        """``&attach_mode=…`` DSN fragment; empty when ``MOTHERDUCK_ATTACH_MODE=default``."""
+        if self.motherduck_attach_mode == "default":
+            return ""
+        return f"&attach_mode={self.motherduck_attach_mode}"
+
+    @property
+    def motherduck_dsn(self) -> str:
+        """MotherDuck connection string for :attr:`motherduck_database`.
+
+        Example: ``md:emissions_db?motherduck_token=***&attach_mode=single``.
+
+        Raises:
+            ConfigurationError: if ``MOTHERDUCK_TOKEN`` is not configured.
+        """
+        return (
+            f"md:{self.motherduck_database}"
+            f"?motherduck_token={self.require_motherduck_token()}"
+            f"{self.motherduck_attach_mode_parameter}"
+        )
 
     @property
     def motherduck_dsn_masked(self) -> str:
         """Token-free connection string, safe to write to logs."""
-        return f"md:{self.motherduck_database}?motherduck_token=***"
+        return (
+            f"md:{self.motherduck_database}?motherduck_token=***"
+            f"{self.motherduck_attach_mode_parameter}"
+        )
+
+    @property
+    def motherduck_workspace_dsn(self) -> str:
+        """``md:`` connection string without a database, used for account-level statements.
+
+        MotherDuck only accepts ``create database`` statements on a workspace-mode ``md:``
+        connection, so the loader uses this DSN to bootstrap a missing database. See
+        :func:`climate_trace_etl.loader.ensure_motherduck_database`.
+
+        Raises:
+            ConfigurationError: if ``MOTHERDUCK_TOKEN`` is not configured.
+        """
+        return f"md:?motherduck_token={self.require_motherduck_token()}"
+
+    @property
+    def motherduck_workspace_dsn_masked(self) -> str:
+        """Token-free ``md:`` connection string, safe to write to logs."""
+        return "md:?motherduck_token=***"
 
 
 @lru_cache(maxsize=1)

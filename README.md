@@ -48,7 +48,8 @@ differs from older Climate TRACE material:
 │   ├── logging_config.py    loguru bootstrap and stdlib interception
 │   ├── client.py            resilient Climate TRACE API v7 client
 │   ├── transformer.py       payload schemas + normalisation into pandas DataFrames
-│   ├── loader.py            DuckDB / MotherDuck loading and data marts
+│   ├── loader.py            DuckDB / MotherDuck loading, database bootstrap and data marts
+│   ├── diagnostics.py       `check-motherduck`: prints what the token can see
 │   └── main.py              CLI entrypoint (run-etl)
 ├── tests/
 │   ├── conftest.py          environment isolation and loguru reset fixtures
@@ -57,6 +58,7 @@ differs from older Climate TRACE material:
 │   ├── test_client.py
 │   ├── test_transformer.py
 │   ├── test_loader.py
+│   ├── test_diagnostics.py
 │   └── test_main.py
 ├── .env.example             documented environment template
 ├── pyproject.toml           Poetry, ruff and pytest configuration
@@ -72,7 +74,8 @@ differs from older Climate TRACE material:
 * [Poetry](https://python-poetry.org/) **2.x**:
   `curl -sSL https://install.python-poetry.org | python3 -`
 * A MotherDuck account and read/write token (only needed once data is loaded to the cloud):
-  <https://app.motherduck.com/settings/tokens>
+  <https://app.motherduck.com/settings/tokens>. The target database does not have to exist: the
+  loader creates it on the first run.
 
 ## Local setup
 
@@ -106,7 +109,7 @@ from climate_trace_etl.config import get_settings
 
 settings = get_settings()  # cached, validated singleton
 settings.fetch_limit  # 500
-settings.motherduck_dsn_masked  # "md:emissions_db?motherduck_token=***"
+settings.motherduck_dsn_masked  # "md:emissions_db?motherduck_token=***&attach_mode=single"
 settings.motherduck_configured  # False until MOTHERDUCK_TOKEN is set
 ```
 
@@ -204,6 +207,33 @@ summary.as_dict()  # {'staging_rows': 13, 'corporate_rows': 10, 'detail_rows': 1
 every log line, and otherwise warns while falling back to a throw-away in-memory DuckDB. That
 keeps the same code path usable locally, in CI and in tests (`duckdb.connect(":memory:")`).
 
+#### Database bootstrap and troubleshooting
+
+MotherDuck never creates a database implicitly: attaching `md:<name>` fails with
+`no database/share named '<name>' found` until the database exists in the account behind the
+token. `connect()` therefore creates a missing `MOTHERDUCK_DATABASE` on demand — through a
+workspace-mode `md:` connection, the only one that accepts `create database` — and retries the
+attachment. A database the token is not allowed to see (read-scaling token, or a token from
+another account) raises a `ConfigurationError` that names the token, the database and the check
+below instead of a raw DuckDB stack trace.
+
+Inspect what a token can actually see before hunting a red CI run:
+
+```bash
+poetry run check-motherduck   # or: python -m climate_trace_etl.diagnostics
+```
+
+The command prints every database and share of the token's account, exits `0` when
+`MOTHERDUCK_DATABASE` is among them and `1` otherwise. To create the database by hand instead:
+
+```sql
+create database if not exists emissions_db;
+```
+
+Automatic creation only helps when the token lacks the database, not when it points at the wrong
+account: `MOTHERDUCK_TOKEN` must belong to the account that hosts the marts, and
+`MOTHERDUCK_DATABASE` must name it.
+
 ### Running the pipeline
 
 ```bash
@@ -242,8 +272,9 @@ or `.env`. Values are validated at startup (fail fast), empty variables are igno
 | Variable | Default | Description |
 | --- | --- | --- |
 | `MOTHERDUCK_TOKEN` | *(unset)* | MotherDuck read/write token; required to load data. |
-| `MOTHERDUCK_DATABASE` | `emissions_db` | Target MotherDuck database. |
+| `MOTHERDUCK_DATABASE` | `emissions_db` | Target MotherDuck database; created on demand when missing. |
 | `MOTHERDUCK_SCHEMA` | `main` | Target schema for the data marts. |
+| `MOTHERDUCK_ATTACH_MODE` | `single` | `single` = one-off session for automation, `workspace` = reuse the MotherDuck UI workspace, `default` = omit the parameter and let the extension decide. |
 | `CLIMATE_TRACE_API_URL` | `https://api.climatetrace.org/v7` | API base URL (trailing slash normalised). |
 | `FETCH_LIMIT` | `500` | Records per paginated API request (`1`–`10000`). |
 | `MAX_ENRICH_RECORDS` | `500` | Facilities enriched with ownership details via `GET /sources/:id` (one request each). |
@@ -283,7 +314,15 @@ Setup:
 | Kind | Name | Purpose |
 | --- | --- | --- |
 | Secret | `MOTHERDUCK_TOKEN` | Read/write token used by the loader. |
-| Variable (optional) | `MOTHERDUCK_DATABASE` | Target database, defaults to `emissions_db`. |
+| Variable (optional) | `MOTHERDUCK_DATABASE` | Target database, defaults to `emissions_db` (created on the first run). |
+| Variable (optional) | `MOTHERDUCK_ATTACH_MODE` | `single` (default), `workspace` or `default`. |
+
+An unset `MOTHERDUCK_DATABASE` variable expands to an empty string, which the settings ignore, so
+the `emissions_db` default applies. When the token cannot see that database, the run logs
+`MotherDuck database emissions_db is not visible to this token yet: creating it`, creates it and
+continues; if the token belongs to a different account, the job fails with a
+`configuration error` line instead of a DuckDB traceback — reproduce it locally with
+`poetry run check-motherduck`.
 
 CI details: Poetry `2.3.2` installed through `pipx`, Python `3.12` with the Poetry download cache,
 the `.venv` cached on `poetry.lock`, `LOG_JSON=true` for machine-readable logs, `ENVIRONMENT=ci`,

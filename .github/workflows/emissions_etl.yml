@@ -85,6 +85,8 @@ jobs:
       MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
       MOTHERDUCK_DATABASE: ${{ vars.MOTHERDUCK_DATABASE }}
       MOTHERDUCK_SCHEMA: ${{ inputs.schema }}
+      # Optional override; unset variables are ignored and the pipeline default ('single') applies.
+      MOTHERDUCK_ATTACH_MODE: ${{ vars.MOTHERDUCK_ATTACH_MODE }}
       MAX_RECORDS: ${{ inputs.max_records }}
       MAX_ENRICH_RECORDS: ${{ inputs.max_enrich_records }}
       ENRICH_WORKERS: ${{ inputs.workers }}

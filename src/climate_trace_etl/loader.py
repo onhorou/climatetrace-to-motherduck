@@ -13,6 +13,12 @@ Every run replaces the staging table and both marts, so the publication is idemp
 marts never mix two extraction windows. Connections are opened against MotherDuck when
 ``MOTHERDUCK_TOKEN`` is configured and against an in-memory DuckDB otherwise, which keeps the
 whole path unit-testable with ``duckdb.connect(":memory:")``.
+
+MotherDuck never creates a database implicitly: attaching ``md:<name>`` for a database the
+account does not host yet fails with ``no database/share named '<name>' found``. The loader
+therefore creates a missing database on demand (:func:`ensure_motherduck_database`) and retries
+the attachment, and it reports a readable :class:`~climate_trace_etl.config.ConfigurationError`
+when the token is not allowed to see the database at all.
 """
 
 from __future__ import annotations
@@ -23,10 +29,13 @@ import duckdb
 import pandas as pd
 from loguru import logger
 
-from climate_trace_etl.config import Settings, get_settings
+from climate_trace_etl.config import ConfigurationError, Settings, get_settings
 
 #: Default schema for every published object.
 DEFAULT_SCHEMA = "main"
+
+#: Fragment of the MotherDuck error raised when a database/share is invisible to the token.
+MISSING_DATABASE_MARKER = "no database/share named"
 
 #: Staging table with one row per (facility, owner) pair.
 ASSET_OWNER_TABLE = "stg_asset_owners"
@@ -44,10 +53,24 @@ def quote_identifier(name: str) -> str:
 
 
 def mask_dsn(dsn: str) -> str:
-    """Return a connection string without its secret token, safe for logs."""
-    if "?" not in dsn:
+    """Return a connection string without its secret token, safe for logs.
+
+    Non-secret parameters such as ``attach_mode`` are preserved, so the log keeps showing how the
+    connection was made.
+    """
+    base, separator, query = dsn.partition("?")
+    if not separator:
         return dsn
-    return f"{dsn.split('?', 1)[0]}?motherduck_token=***"
+
+    parameters = [parameter for parameter in query.split("&") if parameter]
+    if not any(parameter.startswith("motherduck_token=") for parameter in parameters):
+        return dsn
+
+    masked = [
+        "motherduck_token=***",
+        *(parameter for parameter in parameters if not parameter.startswith("motherduck_token=")),
+    ]
+    return f"{base}?{'&'.join(masked)}"
 
 
 @dataclass(frozen=True)
@@ -67,6 +90,92 @@ class LoadSummary:
         }
 
 
+def create_database_sql(database: str) -> str:
+    """SQL that creates ``database`` when the MotherDuck account does not host it yet."""
+    return f"create database if not exists {quote_identifier(database)}"
+
+
+def ensure_motherduck_database(
+    settings: Settings | None = None,
+    *,
+    database: str | None = None,
+) -> str:
+    """Create ``database`` in MotherDuck when it is missing and return its name.
+
+    MotherDuck never creates a database implicitly, so ``md:<name>`` raises
+    ``no database/share named '<name>' found`` until the database exists in the account behind
+    the token. Account-level statements are only accepted by a workspace-mode ``md:``
+    connection, which is why the bootstrap uses
+    :attr:`~climate_trace_etl.config.Settings.motherduck_workspace_dsn`.
+
+    Args:
+        settings: Configuration to use; defaults to
+            :func:`climate_trace_etl.config.get_settings`.
+        database: Database to create, overriding ``MOTHERDUCK_DATABASE``.
+
+    Returns:
+        The name of the database that now exists.
+
+    Raises:
+        ConfigurationError: if no MotherDuck token is configured.
+        duckdb.Error: if the token is not allowed to create a database (for example a
+            read-scaling token, or a token from another account).
+    """
+    current = settings or get_settings()
+    name = database or current.motherduck_database
+    admin_dsn = current.motherduck_workspace_dsn
+
+    logger.info("ensuring MotherDuck database {} exists via {}", name, mask_dsn(admin_dsn))
+    with duckdb.connect(admin_dsn) as admin_connection:
+        admin_connection.execute(create_database_sql(name))
+    logger.success("MotherDuck database {} is ready", name)
+    return name
+
+
+def _missing_database_hint(settings: Settings, error: Exception) -> str:
+    """Actionable message for a database the token is not allowed to attach."""
+    return (
+        f"could not attach MotherDuck database '{settings.motherduck_database}': {error}. "
+        "Check that MOTHERDUCK_TOKEN belongs to the account that hosts the database and that "
+        "MOTHERDUCK_DATABASE names it; `poetry run check-motherduck` lists every database the "
+        "token can see."
+    )
+
+
+def _connect_motherduck(
+    settings: Settings,
+    *,
+    read_only: bool = False,
+) -> duckdb.DuckDBPyConnection:
+    """Attach the configured MotherDuck database, creating it when the token cannot see it yet."""
+    target = settings.motherduck_dsn
+    logger.info("opening DuckDB connection to {}", mask_dsn(target))
+    try:
+        return duckdb.connect(target, read_only=read_only)
+    except duckdb.Error as error:
+        if MISSING_DATABASE_MARKER not in str(error):
+            raise
+        if read_only:
+            raise ConfigurationError(_missing_database_hint(settings, error)) from error
+        logger.warning(
+            "MotherDuck database {} is not visible to this token yet: creating it",
+            settings.motherduck_database,
+        )
+
+    try:
+        ensure_motherduck_database(settings)
+    except duckdb.Error as error:
+        raise ConfigurationError(_missing_database_hint(settings, error)) from error
+
+    try:
+        connection = duckdb.connect(target, read_only=read_only)
+    except duckdb.Error as error:
+        raise ConfigurationError(_missing_database_hint(settings, error)) from error
+
+    logger.debug("MotherDuck session established for database {}", settings.motherduck_database)
+    return connection
+
+
 def connect(
     settings: Settings | None = None,
     *,
@@ -75,11 +184,18 @@ def connect(
 ) -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection to MotherDuck, or to an in-memory database.
 
+    A missing MotherDuck database is created on demand (see
+    :func:`ensure_motherduck_database`); a database the token is not allowed to see raises a
+    :class:`~climate_trace_etl.config.ConfigurationError` instead of leaking the raw DuckDB
+    message.
+
     Args:
         settings: Configuration to use; defaults to
             :func:`climate_trace_etl.config.get_settings`.
-        database: Explicit DuckDB/MotherDuck connection string, overriding the configuration.
-        read_only: Forwarded to ``duckdb.connect``.
+        database: Explicit DuckDB/MotherDuck connection string, overriding the configuration. No
+            database is ever created for an explicit target.
+        read_only: Forwarded to ``duckdb.connect``. A read-only connection never creates the
+            MotherDuck database.
 
     Returns:
         An open :class:`duckdb.DuckDBPyConnection`. Callers close it (or use it as a context
@@ -87,20 +203,16 @@ def connect(
     """
     current = settings or get_settings()
     if database is not None:
-        target = database
-    elif current.motherduck_configured:
-        target = current.motherduck_dsn
-    else:
+        logger.info("opening DuckDB connection to {}", mask_dsn(database))
+        return duckdb.connect(database, read_only=read_only)
+
+    if not current.motherduck_configured:
         logger.warning(
             "MOTHERDUCK_TOKEN is not set: loading into a temporary in-memory DuckDB instead"
         )
-        target = ":memory:"
+        return duckdb.connect(":memory:", read_only=read_only)
 
-    logger.info("opening DuckDB connection to {}", mask_dsn(target))
-    connection = duckdb.connect(target, read_only=read_only)
-    if target.startswith("md:"):
-        logger.debug("MotherDuck session established for database {}", current.motherduck_database)
-    return connection
+    return _connect_motherduck(current, read_only=read_only)
 
 
 def ensure_schema(connection: duckdb.DuckDBPyConnection, schema: str = DEFAULT_SCHEMA) -> None:

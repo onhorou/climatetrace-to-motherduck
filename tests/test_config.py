@@ -27,6 +27,7 @@ def test_documented_defaults_are_applied() -> None:
     assert settings.retry_backoff_seconds == 1.0
     assert settings.motherduck_database == "emissions_db"
     assert settings.motherduck_schema == "main"
+    assert settings.motherduck_attach_mode == "single"
     assert settings.motherduck_configured is False
     assert settings.environment == "local"
     assert settings.log_level == "INFO"
@@ -92,8 +93,42 @@ def test_invalid_enum_values_are_rejected(invalid: dict[str, str]) -> None:
 def test_motherduck_dsn_is_built_from_database_and_token() -> None:
     settings = make_settings(motherduck_token="secret-token", motherduck_database="analytics")
 
-    assert settings.motherduck_dsn == "md:analytics?motherduck_token=secret-token"
-    assert settings.motherduck_dsn_masked == "md:analytics?motherduck_token=***"
+    assert (
+        settings.motherduck_dsn == "md:analytics?motherduck_token=secret-token&attach_mode=single"
+    )
+    assert settings.motherduck_dsn_masked == "md:analytics?motherduck_token=***&attach_mode=single"
+
+
+def test_motherduck_attach_mode_can_be_switched_to_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MOTHERDUCK_ATTACH_MODE", "workspace")
+
+    settings = make_settings(motherduck_token="secret-token")
+
+    assert settings.motherduck_attach_mode == "workspace"
+    assert settings.motherduck_dsn.endswith("&attach_mode=workspace")
+
+
+def test_unknown_motherduck_attach_mode_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        make_settings(motherduck_attach_mode="whatever")
+
+
+def test_motherduck_attach_mode_default_omits_the_parameter() -> None:
+    """``default`` keeps the extension's own default, which is the escape hatch for the DSN."""
+    settings = make_settings(motherduck_token="secret-token", motherduck_attach_mode="default")
+
+    assert settings.motherduck_attach_mode_parameter == ""
+    assert settings.motherduck_dsn == "md:emissions_db?motherduck_token=secret-token"
+    assert settings.motherduck_dsn_masked == "md:emissions_db?motherduck_token=***"
+
+
+def test_motherduck_workspace_dsn_targets_the_account() -> None:
+    settings = make_settings(motherduck_token="secret-token", motherduck_database="analytics")
+
+    assert settings.motherduck_workspace_dsn == "md:?motherduck_token=secret-token"
+    assert settings.motherduck_workspace_dsn_masked == "md:?motherduck_token=***"
 
 
 def test_motherduck_dsn_requires_a_token() -> None:
@@ -101,6 +136,9 @@ def test_motherduck_dsn_requires_a_token() -> None:
 
     with pytest.raises(ConfigurationError, match="MOTHERDUCK_TOKEN"):
         _ = settings.motherduck_dsn
+
+    with pytest.raises(ConfigurationError, match="MOTHERDUCK_TOKEN"):
+        _ = settings.motherduck_workspace_dsn
 
 
 def test_secrets_never_leak_into_repr_or_serialisation() -> None:
