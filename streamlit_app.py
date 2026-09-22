@@ -18,7 +18,8 @@ Streamlit Community Cloud -- and from the process environment afterwards, so
 
 Table and column names mirror :mod:`climate_trace_etl.loader`. The duplication is deliberate:
 the dashboard stays a self-contained script, so Streamlit Community Cloud only has to install
-``requirements.txt`` and never the ETL package itself.
+``requirements.txt`` and never the ETL package itself. Country codes are expanded into full
+names with :mod:`pycountry`; the SQL keeps filtering on the bare ISO 3166-1 alpha-3 code.
 """
 
 from __future__ import annotations
@@ -26,11 +27,13 @@ from __future__ import annotations
 import os
 import textwrap
 from dataclasses import dataclass
+from functools import cache
 from typing import Any
 
 import duckdb
 import pandas as pd
 import plotly.express as px
+import pycountry
 import streamlit as st
 
 #: Company-level mart published by :mod:`climate_trace_etl.loader`.
@@ -58,6 +61,9 @@ FILTER_CACHE_SECONDS = 600
 
 #: Section label shown while no specific country is selected.
 ALL_COUNTRIES = "Все страны"
+
+#: Country code the loader writes for facilities whose country is not published.
+UNKNOWN_COUNTRY = "Unknown"
 
 #: Plotly layout margin reused by every chart.
 PLOTLY_MARGIN: dict[str, int] = {"l": 10, "r": 10, "t": 10, "b": 10}
@@ -355,6 +361,26 @@ def _unique_values(frame: pd.DataFrame, kind: str) -> list[str]:
     return sorted({str(value) for value in values if pd.notna(value) and str(value) != ""})
 
 
+@cache
+def country_label(code: str) -> str:
+    """Display label of an ISO 3166-1 alpha-3 ``code``: ``DEU`` renders as ``Germany (DEU)``.
+
+    Only the presentation changes -- the dropdown still carries the bare code, so it is the
+    value that reaches the parameterised ``country = ?`` clause. Codes :mod:`pycountry` cannot
+    resolve (``Unknown``, territories without an ISO 3166-1 entry) and :data:`ALL_COUNTRIES`
+    are returned unchanged, so no option ever renders empty.
+    """
+    if not code or code in (ALL_COUNTRIES, UNKNOWN_COUNTRY):
+        return code
+    country = pycountry.countries.get(alpha_3=code.upper())
+    return f"{country.name} ({code.upper()})" if country is not None else code
+
+
+def with_country_labels(frame: pd.DataFrame, column: str = "country") -> pd.DataFrame:
+    """Copy of ``frame`` with ``column`` replaced by its :func:`country_label` labels."""
+    return frame.assign(**{column: frame[column].map(country_label)})
+
+
 @st.cache_data(ttl=FILTER_CACHE_SECONDS, show_spinner=False)
 def load_filter_options(dsn: str, schema: str, read_only: bool) -> dict[str, list[Any]]:
     """Countries, sectors and years available in the marts.
@@ -420,7 +446,12 @@ def render_sidebar(options: dict[str, list[Any]], target: ConnectionTarget) -> t
     """Render the filter widgets and return the selection plus the top-N size."""
     st.sidebar.header("Параметры фильтрации")
 
-    country = st.sidebar.selectbox("Страна", [ALL_COUNTRIES, *options["country"]])
+    country = st.sidebar.selectbox(
+        "Страна",
+        [ALL_COUNTRIES, *options["country"]],
+        format_func=country_label,
+        help="Полные названия даёт ISO 3166-1 (pycountry); SQL по-прежнему фильтрует по коду.",
+    )
     sectors = st.sidebar.multiselect("Секторы", options["sector"])
     years = st.sidebar.multiselect("Годы", options["year"])
     exclude_state_owners = st.sidebar.checkbox(
@@ -478,7 +509,7 @@ def render_top_companies(
     top_n: int,
 ) -> None:
     """Horizontal bar chart of the largest emitters."""
-    frame = run_query(connection, top_companies_sql(schema, filters, top_n))
+    frame = with_country_labels(run_query(connection, top_companies_sql(schema, filters, top_n)))
     st.subheader(f"ТОП-{top_n} компаний по выбросам")
     if frame.empty:
         st.info("Нет компаний, подходящих под выбранные фильтры.")
@@ -564,7 +595,9 @@ def render_detail_table(
     filters: Filters,
 ) -> None:
     """Collapsible facility drill-down of the current selection."""
-    frame = run_query(connection, detail_sql(schema, filters, DETAIL_TABLE_ROWS))
+    frame = with_country_labels(
+        run_query(connection, detail_sql(schema, filters, DETAIL_TABLE_ROWS))
+    )
     with st.expander(f"Детализация по объектам (первые {DETAIL_TABLE_ROWS} строк)"):
         if frame.empty:
             st.info("Нет объектов под выбранные фильтры.")

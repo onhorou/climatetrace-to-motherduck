@@ -45,6 +45,7 @@ dev = [
 # the same set from requirements.txt, which it prefers over pyproject.toml.
 dashboard = [
   "plotly>=5.24",
+  "pycountry>=26.2",
   "streamlit>=1.49",
 ]
 

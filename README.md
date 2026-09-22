@@ -279,6 +279,9 @@ countries, facilities), a top-N ranking coloured by country, a sector treemap, a
 and a facility drill-down table. The sidebar filters by country, sector and year, controls the
 top-N size and toggles whether state / unmapped owners (`is_state_or_unmapped_owner`) are
 included; the *Обновить данные* button drops the cached dropdowns after a fresh `run-etl`.
+Wherever a country appears — dropdown, chart legend, drill-down table — the ISO 3166-1 alpha-3
+code stored in the marts is expanded to `Germany (DEU)` with `pycountry`, while the filters keep
+binding the bare code as a query parameter.
 
 ### Running locally
 
@@ -316,7 +319,7 @@ DASHBOARD_DUCKDB_PATH=/tmp/emissions.duckdb poetry run streamlit run streamlit_a
 | `DASHBOARD_DUCKDB_PATH` | *(unset)* | Render a local DuckDB snapshot instead of MotherDuck. |
 
 Community Cloud installs `requirements.txt` from the repository root, because that file takes
-precedence over `pyproject.toml` in its dependency resolution; the dashboard pins its four
+precedence over `pyproject.toml` in its dependency resolution; the dashboard pins its five
 dependencies there. The page is read-only (it never writes to the marts) and every filter is
 bound as a query parameter, so a country or sector name can never end up interpolated into SQL.
 

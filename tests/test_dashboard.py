@@ -17,6 +17,7 @@ from types import ModuleType
 from typing import Any
 
 import duckdb
+import pandas as pd
 import pytest
 
 from climate_trace_etl.loader import publish_frame
@@ -128,6 +129,28 @@ def test_default_attach_mode_is_not_sent(dashboard: ModuleType) -> None:
     assert dsn == "md:emissions_db?motherduck_token=secret"
 
 
+def test_country_label_expands_iso_codes(dashboard: ModuleType) -> None:
+    """ISO 3166-1 alpha-3 codes become ``Name (CODE)`` labels."""
+    assert dashboard.country_label("DEU") == "Germany (DEU)"
+    assert dashboard.country_label("deu") == "Germany (DEU)"
+    assert dashboard.country_label("BRA") == "Brazil (BRA)"
+
+
+def test_country_label_keeps_the_codes_it_cannot_resolve(dashboard: ModuleType) -> None:
+    """The sentinel, the loader's placeholder and unknown codes fall back to the raw value."""
+    assert dashboard.country_label(dashboard.ALL_COUNTRIES) == dashboard.ALL_COUNTRIES
+    assert dashboard.country_label("Unknown") == "Unknown"
+    assert dashboard.country_label("ZZZ") == "ZZZ"
+    assert dashboard.country_label(None) is None
+
+
+def test_country_labels_are_applied_to_a_frame(dashboard: ModuleType) -> None:
+    frame = pd.DataFrame({"country": ["DEU", "Unknown"], "emissions_m_tons": [1.0, 2.0]})
+    labelled = dashboard.with_country_labels(frame)
+    assert labelled["country"].tolist() == ["Germany (DEU)", "Unknown"]
+    assert frame["country"].tolist() == ["DEU", "Unknown"]  # the original frame is untouched
+
+
 def test_where_clause_is_parameterised(dashboard: ModuleType) -> None:
     filters = dashboard.Filters(country="DEU", sectors=("power", "steel"), years=(2024, 2025))
     where, parameters = filters.where_clause()
@@ -172,6 +195,15 @@ def test_state_owned_emissions_can_be_included(app: Any) -> None:
 
 
 def test_country_filter_restricts_the_selection(app: Any) -> None:
+    app.selectbox[0].select("DEU").run()
+    assert not app.exception
+    assert app.selectbox[0].value == "DEU"
+    assert [float(metric.value) for metric in app.metric] == [2.0, 3.0, 1.0, 2.0]
+
+
+def test_country_dropdown_offers_full_names(app: Any) -> None:
+    """The dropdown renders ``Germany (DEU)`` while the selection stays the bare ISO code."""
+    assert "Germany (DEU)" in app.selectbox[0].options
     app.selectbox[0].select("DEU").run()
     assert not app.exception
     assert app.selectbox[0].value == "DEU"
