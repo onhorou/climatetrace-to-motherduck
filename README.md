@@ -41,6 +41,7 @@ differs from older Climate TRACE material:
 
 ```
 .
+├── .github/workflows/emissions_etl.yml   # manual CI run: lint, tests, ETL, mart verification
 ├── src/climate_trace_etl/
 │   ├── __init__.py          package metadata and version
 │   ├── config.py            pydantic-settings configuration + get_settings()
@@ -264,6 +265,37 @@ poetry run pytest tests/test_client.py -q
 poetry run ruff check .          # lint rules: E, W, F, I, B, BLE, C4, UP, SIM, RET, PTH, RUF
 poetry run ruff format .         # auto-format (line length 100, Markdown code blocks included)
 poetry run run-etl --dry-run --max-records 5   # end-to-end smoke test without writes
+```
+
+## GitHub Actions
+
+`.github/workflows/emissions_etl.yml` is **manual-only**: there is no `schedule:` trigger, so a run
+starts exactly when you ask for one.
+
+1. **Actions → Emissions ETL → Run workflow** (or `gh workflow run emissions_etl.yml`).
+2. Optionally override the inputs: facilities to extract, facilities to enrich, worker threads,
+   target schema, and a dry-run toggle that skips every write to MotherDuck.
+3. The `quality` job lints, checks formatting and runs the unit tests; the `etl` job then
+   extracts, transforms, loads, and finally verifies that both marts contain rows.
+
+Setup:
+
+| Kind | Name | Purpose |
+| --- | --- | --- |
+| Secret | `MOTHERDUCK_TOKEN` | Read/write token used by the loader. |
+| Variable (optional) | `MOTHERDUCK_DATABASE` | Target database, defaults to `emissions_db`. |
+
+CI details: Poetry `2.3.2` installed through `pipx`, Python `3.12` with the Poetry download cache,
+the `.venv` cached on `poetry.lock`, `LOG_JSON=true` for machine-readable logs, `ENVIRONMENT=ci`,
+a `concurrency` group so two runs can never overlap, and a 10-minute job timeout.
+
+To restore periodic execution later, add a schedule next to the manual trigger:
+
+```yaml
+on:
+  schedule:
+    - cron: "0 6 * * 1" # every Monday at 06:00 UTC
+  workflow_dispatch:
 ```
 
 ## MotherDuck data marts

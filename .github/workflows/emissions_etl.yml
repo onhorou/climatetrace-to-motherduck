@@ -1,0 +1,151 @@
+name: Emissions ETL
+
+# Manual-only by design: there is no `schedule:` trigger. Start a run from the Actions tab
+# ("Run workflow") or with `gh workflow run emissions_etl.yml` whenever a fresh extraction
+# window should be published.
+on:
+  workflow_dispatch:
+    inputs:
+      max_records:
+        description: "Facilities to extract (leave empty for no limit)"
+        required: false
+        default: "500"
+      max_enrich_records:
+        description: "Facilities enriched with ownership details via GET /sources/:id"
+        required: false
+        default: "500"
+      workers:
+        description: "Enrichment worker threads (1 = sequential)"
+        required: false
+        default: "8"
+      schema:
+        description: "Target MotherDuck schema"
+        required: false
+        default: "main"
+      dry_run:
+        description: "Extract and transform only, skipping every write to MotherDuck"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emissions-etl
+  cancel-in-progress: false
+
+jobs:
+  quality:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Poetry
+        run: pipx install poetry==2.3.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: poetry
+
+      - name: Configure an in-project virtualenv
+        run: poetry config virtualenvs.in-project true
+
+      - name: Cache the virtualenv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Lint
+        run: poetry run ruff check .
+
+      - name: Check formatting
+        run: poetry run ruff format --check .
+
+      - name: Run the unit tests
+        run: poetry run pytest -q
+
+  etl:
+    name: Extract, transform and load
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ENVIRONMENT: ci
+      LOG_JSON: "true"
+      MOTHERDUCK_TOKEN: ${{ secrets.MOTHERDUCK_TOKEN }}
+      MOTHERDUCK_DATABASE: ${{ vars.MOTHERDUCK_DATABASE }}
+      MOTHERDUCK_SCHEMA: ${{ inputs.schema }}
+      MAX_RECORDS: ${{ inputs.max_records }}
+      MAX_ENRICH_RECORDS: ${{ inputs.max_enrich_records }}
+      ENRICH_WORKERS: ${{ inputs.workers }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install Poetry
+        run: pipx install poetry==2.3.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: poetry
+
+      - name: Configure an in-project virtualenv
+        run: poetry config virtualenvs.in-project true
+
+      - name: Cache the virtualenv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-py3.12-${{ hashFiles('poetry.lock') }}
+
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Run the ETL
+        run: |
+          set -euo pipefail
+
+          args=()
+          if [ -n "${MAX_RECORDS:-}" ]; then
+            args+=(--max-records "$MAX_RECORDS")
+          fi
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            args+=(--dry-run)
+          fi
+
+          poetry run run-etl ${args[@]+"${args[@]}"}
+
+      - name: Verify the marts in MotherDuck
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          poetry run python - <<'PY'
+          from climate_trace_etl.config import get_settings
+          from climate_trace_etl.loader import (
+              MART_COMPANY_ASSETS_DETAIL,
+              MART_CORPORATE_EMISSIONS,
+              connect,
+              count_rows,
+          )
+
+          settings = get_settings()
+          with connect(settings) as connection:
+              for table in (MART_CORPORATE_EMISSIONS, MART_COMPANY_ASSETS_DETAIL):
+                  rows = count_rows(connection, settings.motherduck_schema, table)
+                  print(f"{table}: {rows} row(s)")
+                  if rows == 0:
+                      raise SystemExit(f"{table} is empty after the load")
+          PY
