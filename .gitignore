@@ -216,3 +216,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# Climate TRACE -> MotherDuck pipeline
+# ---------------------------------------------------------------------------
+# Local secrets (never commit the MotherDuck token)
+.env
+.env.local
+.env.*.local
+
+# Local DuckDB / MotherDuck artefacts
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+.duckdb/
+data/
+
+# Local extraction dumps produced by ad-hoc runs
+*.parquet
+*.csv.gz
+tmp/
